@@ -1,3 +1,4 @@
+extern crate actix;
 extern crate actix_web;
 #[macro_use]
 extern crate serde_derive;
@@ -20,6 +21,16 @@ table! {
         id -> Bigint,
         address -> Text,
         status -> Smallint,
+    }
+}
+
+table! {
+    geocodes (address, source) {
+        address -> Text,
+        latitude -> Double,
+        longitude -> Double,
+        valid -> Bool,
+        source -> Text,
     }
 }
 
@@ -48,6 +59,13 @@ struct GeocodePost {
     address: Vec<String>
 }
 
+#[derive(Serialize, Deserialize, Debug)]
+struct GeocodeInsert {
+    address: String,
+    latitude: f64,
+    longitude: f64
+}
+
 fn index(_req: HttpRequest) -> &'static str {
     "OK"
 }
@@ -72,42 +90,43 @@ fn geocode_post(req: HttpRequest) -> Box<Future<Item=HttpResponse, Error=Error>>
     req.json()
         .from_err()  // convert all errors into `Error`
         .and_then(|data: Vec<String>| {
-
-            // TODO: Move the lowercasing to the front-end
-            let lower_data: Vec<String> = data.iter().map(|ref x| x.to_lowercase()).collect();
-
             let url = env::var("DATABASE_URL").expect("DATABASE_URL env var missing");
             let connection = PgConnection::establish(&url).expect("Couldn't connect to database");
-            let result: Vec<(String, Option<f64>, Option<f64>, bool)> = sql("SELECT address, longitude, latitude, valid FROM geocodes WHERE lower(address) = ANY (")
-            .bind::<sql_types::Array<sql_types::Text>,_>(&lower_data)
-            .sql(") ORDER BY valid DESC;")
+            let result: Vec<(String, Option<f64>, Option<f64>, bool)> = sql("SELECT address, longitude, latitude, valid FROM geocodes WHERE address = ANY (")
+            .bind::<sql_types::Array<sql_types::Text>,_>(&data)
+            .sql(") ORDER BY source DESC;")
             .load(&connection)
             .expect("Error selecting from geocodes");
 
-            let mut lower_data_hashset: HashSet<String> = HashSet::from_iter(lower_data);
+            let mut data_hashset: HashSet<String> = HashSet::from_iter(data);
             let mut out_data: Vec<Geocode> = Vec::new();
 
-            for row in result {
-                if lower_data_hashset.remove(&row.0.to_lowercase()) {
-                    if row.3 {
-                        out_data.push(Geocode {address: row.0, longitude: row.1.unwrap_or(0.0), latitude: row.2.unwrap_or(0.0)})
+            for row in &result {
+                if row.3 {
+                    if data_hashset.remove(&row.0) {
+                        out_data.push(Geocode {address: row.0.clone(), longitude: row.1.unwrap_or(0.0), latitude: row.2.unwrap_or(0.0)});
                     }
                 }
             }
+            for row in &result {
+                if !row.3 {
+                    data_hashset.remove(&row.0);
+                }
+            }
 
-            if lower_data_hashset.len() > 0 {
+            if data_hashset.len() > 0 {
+                // TODO: Rewrite init as map
                 let mut pending = Vec::new();
-                for a in lower_data_hashset {
-                    // TODO: set status field default to 0 in DB
-                    pending.push((geocodes_pending::columns::address.eq(a), geocodes_pending::columns::status.eq(0)));
+                for a in data_hashset {
+                    pending.push(geocodes_pending::columns::address.eq(a));
                 }
 
-                let query = insert_into(geocodes_pending::table)
+                insert_into(geocodes_pending::table)
                 .values(&pending)
                 .on_conflict(geocodes_pending::columns::address)
-                .do_nothing();
-                println!("{}", debug_query::<pg::Pg, _>(&query));
-                query.execute(&connection);
+                .do_nothing()
+                .execute(&connection)
+                .unwrap_or(0);
             }
 
             let queue_target: i64 = sql("SELECT id FROM geocodes_pending ORDER BY id DESC LIMIT 1;").get_result(&connection).unwrap_or(0);
@@ -122,12 +141,52 @@ fn geocode_post(req: HttpRequest) -> Box<Future<Item=HttpResponse, Error=Error>>
         .responder()
 }
 
+fn geocode_insert(req: HttpRequest) -> Box<Future<Item=HttpResponse, Error=Error>> {
+    let remote_addr = String::from("remote_addr|") + req.connection_info().remote().unwrap_or("unknown").clone();
+    req.json()
+        .from_err()  // convert all errors into `Error`
+        .and_then(move |data: GeocodeInsert| {
+            println!("{:?}", data);
+            let url = env::var("DATABASE_URL").expect("DATABASE_URL env var missing");
+            let connection = PgConnection::establish(&url).expect("Couldn't connect to database");
+            let query = insert_into(geocodes::table)
+            .values((
+                geocodes::columns::address.eq(data.address.to_lowercase()),
+                geocodes::columns::latitude.eq(data.latitude),
+                geocodes::columns::longitude.eq(data.longitude),
+                geocodes::columns::valid.eq(true),
+                geocodes::columns::source.eq(remote_addr)))
+            .on_conflict((geocodes::columns::address, geocodes::columns::source))
+            .do_update()
+            .set((geocodes::columns::latitude.eq(data.latitude), geocodes::columns::longitude.eq(data.longitude)));
+            println!("{}", debug_query::<pg::Pg, _>(&query));
+            query.execute(&connection).unwrap_or(0);
+
+            Ok(HttpResponse::Ok().finish())
+        })
+        .responder()
+}
+
 fn main() {
+    let url = env::var("DATABASE_URL").expect("DATABASE_URL env var missing");
+    let connection = PgConnection::establish(&url).expect("Couldn't connect to database");
+    sql::<usize>("CREATE TABLE IF NOT EXISTS geocodes (address TEXT, latitude DOUBLE PRECISION, longitude DOUBLE PRECISION, valid BOOLEAN, source VARCHAR(50), PRIMARY KEY (address, source));")
+    .execute(&connection)
+    .unwrap_or(0);
+    sql::<usize>("CREATE TABLE IF NOT EXISTS geocodes_pending (id BIGSERIAL PRIMARY KEY, address TEXT UNIQUE, status SMALLINT DEFAULT 0);")
+    .execute(&connection)
+    .unwrap_or(0);
+
+    let sys = actix::System::new("guide");
+
     server::HttpServer::new(
         || App::new()
             .resource("/", |r| r.f(index))
             .resource("/api/queue_status", |r| r.f(queue_status))
-            .resource("/api/geocodepost", |r| r.f(geocode_post)))
+            .resource("/api/geocodepost", |r| r.f(geocode_post))
+            .resource("/api/geocode_insert", |r| r.f(geocode_insert)))
         .bind("0.0.0.0:8000").expect("Couldn't bind to address")
-        .run();
+        .start();
+    
+    sys.run();
 }
